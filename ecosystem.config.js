@@ -3,7 +3,7 @@ module.exports = {
         {
             name: "pikalo-bot",
             script: "bot.py",
-            interpreter: "python3",
+            interpreter: "./venv/bin/python3",
             restart_delay: 5000,
             autorestart: true,
             max_memory_restart: "200M",

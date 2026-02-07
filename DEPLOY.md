@@ -13,6 +13,7 @@ The `aiortc` and `av` Python libraries require several system-level media librar
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
+    python3-venv \
     libavdevice-dev \
     libavfilter-dev \
     libavformat-dev \
@@ -34,11 +35,12 @@ cd ~/pibot
 
 If the repository is private, ensure you have set up SSH keys or use a Personal Access Token.
 
-### 3. Install Python Dependencies
-On the droplet, navigate to the directory and install requirements:
+### 3. Setup Virtual Environment & Install Dependencies
+On the droplet, navigate to the directory and set up the isolated environment:
 ```bash
 cd ~/pibot
-pip3 install -r requirements.txt
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
 ```
 
 ### 4. Start with PM2
