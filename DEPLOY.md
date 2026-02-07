@@ -24,17 +24,15 @@ sudo apt-get install -y \
     build-essential
 ```
 
-### 2. Transfer Files
-Transfer your project files to a directory on your droplet (e.g., `~/pibot`):
-- `bot.py`
-- `requirements.txt`
-- `sample.mp4`
-- `ecosystem.config.js`
+### 2. Clone the Repository
+Clone the bot project to a directory on your droplet (e.g., `~/pibot`):
 
-You can use `scp`:
 ```bash
-scp bot.py requirements.txt sample.mp4 ecosystem.config.js user@your_droplet_ip:~/pibot/
+git clone https://github.com/andreinossov/pibot.git ~/pibot
+cd ~/pibot
 ```
+
+If the repository is private, ensure you have set up SSH keys or use a Personal Access Token.
 
 ### 3. Install Python Dependencies
 On the droplet, navigate to the directory and install requirements:
