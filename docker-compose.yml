@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: pikalo-bot
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
