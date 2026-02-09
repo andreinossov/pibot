@@ -12,7 +12,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pibot")
 
 SIGNALING_URL = "wss://sig.piedpie.net"
-BOT_ROOM_ID = "pibot"
+BOT_EMAIL = "bot@piedpie.net"
+BOT_ROOM_ID = BOT_EMAIL.lower().strip()[:30].encode().hex()
 SAMPLE_VIDEO = "sample.mp4"
 
 class PikaloBot:
