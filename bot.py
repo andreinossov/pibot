@@ -42,6 +42,12 @@ class PikaloBot:
 
     async def handle_message(self, msg):
         msg_type = msg.get("type")
+
+        if msg_type == "ping":
+            # Reply to server keepalive pings to prevent connection timeout
+            await self.ws.send(json.dumps({"type": "pong"}))
+            return
+
         logger.info(f"Received message: {msg_type}")
 
         if msg_type == "connected":
