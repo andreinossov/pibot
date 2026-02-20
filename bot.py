@@ -73,18 +73,30 @@ class PikaloBot:
             sender_id = msg.get("sender") or msg.get("senderId")
 
             if signal_type == "offer":
-                logger.info(f"Received offer from {sender_id}. Auto-accepting...")
-                await self.accept_call(sender_id, payload.get("sdp"))
+                # Ignore duplicate offers while a call is active (race condition protection)
+                if self.pc and self.pc.iceConnectionState not in ("closed", "failed", "disconnected"):
+                    logger.info(f"Ignoring duplicate offer from {sender_id} -- active PC in state {self.pc.iceConnectionState}")
+                else:
+                    logger.info(f"Received offer from {sender_id}. Auto-accepting...")
+                    await self.accept_call(sender_id, payload.get("sdp"))
 
             elif signal_type == "ice-candidate":
                 if self.pc:
                     candidate_dict = payload.get("candidate")
+                    if not candidate_dict:
+                        return
+                    # Skip candidates with missing required fields
+                    ip = candidate_dict.get("address") or candidate_dict.get("ip")
+                    foundation = candidate_dict.get("foundation")
+                    if not foundation or not ip:
+                        logger.debug("Skipping ICE candidate with missing fields")
+                        return
                     try:
                         # aiortc expects camelCase kwargs
                         candidate = RTCIceCandidate(
                             component=candidate_dict.get("component"),
-                            foundation=candidate_dict.get("foundation"),
-                            ip=candidate_dict.get("address") or candidate_dict.get("ip"),
+                            foundation=foundation,
+                            ip=ip,
                             port=candidate_dict.get("port"),
                             priority=candidate_dict.get("priority"),
                             protocol=candidate_dict.get("protocol"),
