@@ -11,8 +11,6 @@ from aiortc.contrib.media import MediaPlayer
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pibot")
-# Enable DEBUG for ICE diagnostics
-logging.getLogger("aioice").setLevel(logging.DEBUG)
 
 SIGNALING_URL = "wss://sig.piedpie.net"
 BOT_EMAIL = "bot@piedpie.net"
