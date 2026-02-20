@@ -79,22 +79,25 @@ class PikaloBot:
             elif signal_type == "ice-candidate":
                 if self.pc:
                     candidate_dict = payload.get("candidate")
-                    # aiortc expects candidates with sdpMid and sdpMLineIndex
-                    candidate = RTCIceCandidate(
-                        component=candidate_dict.get("component"),
-                        foundation=candidate_dict.get("foundation"),
-                        ip=candidate_dict.get("address") or candidate_dict.get("ip"),
-                        port=candidate_dict.get("port"),
-                        priority=candidate_dict.get("priority"),
-                        protocol=candidate_dict.get("protocol"),
-                        type=candidate_dict.get("type"),
-                        related_address=candidate_dict.get("relatedAddress"),
-                        related_port=candidate_dict.get("relatedPort"),
-                        sdpMid=candidate_dict.get("sdpMid"),
-                        sdpMLineIndex=candidate_dict.get("sdpMLineIndex")
-                    )
-                    await self.pc.addIceCandidate(candidate)
-                    logger.info("Added ICE candidate")
+                    try:
+                        # aiortc expects camelCase kwargs
+                        candidate = RTCIceCandidate(
+                            component=candidate_dict.get("component"),
+                            foundation=candidate_dict.get("foundation"),
+                            ip=candidate_dict.get("address") or candidate_dict.get("ip"),
+                            port=candidate_dict.get("port"),
+                            priority=candidate_dict.get("priority"),
+                            protocol=candidate_dict.get("protocol"),
+                            type=candidate_dict.get("type"),
+                            relatedAddress=candidate_dict.get("relatedAddress"),
+                            relatedPort=candidate_dict.get("relatedPort"),
+                            sdpMid=candidate_dict.get("sdpMid"),
+                            sdpMLineIndex=candidate_dict.get("sdpMLineIndex")
+                        )
+                        await self.pc.addIceCandidate(candidate)
+                        logger.info("Added ICE candidate")
+                    except Exception as e:
+                        logger.warning(f"Failed to add ICE candidate: {e}")
 
             elif signal_type == "hangup":
                 logger.info("Call hung up by peer")
