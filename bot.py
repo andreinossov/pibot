@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import ssl
+import aiohttp
 import websockets
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaPlayer
 
 # Configure logging
@@ -14,7 +15,10 @@ logger = logging.getLogger("pibot")
 SIGNALING_URL = "wss://sig.piedpie.net"
 BOT_EMAIL = "bot@piedpie.net"
 BOT_ROOM_ID = BOT_EMAIL.lower().strip()[:30].encode().hex()
-SAMPLE_VIDEO = "sample.mp4"
+SAMPLE_VIDEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample.mp4")
+REG_SERVER = "https://reg.piedpie.net"
+ICE_TIMEOUT_SECONDS = 15  # Max time to wait for ICE connection
+
 
 class PikaloBot:
     def __init__(self):
@@ -22,12 +26,49 @@ class PikaloBot:
         self.ws = None
         self.my_id = None
         self.player = None
+        self.ice_timeout_task = None
+        self.ice_servers = []
+
+    async def fetch_turn_credentials(self):
+        """Fetch ephemeral TURN credentials from the registration server."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{REG_SERVER}/turn-credentials?userId=pibot",
+                    ssl=False
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("success") and data.get("iceServers"):
+                        self.ice_servers = []
+                        for server in data["iceServers"]:
+                            username = server.get("username")
+                            credential = server.get("credential")
+                            # Add all TURN URL variants for best connectivity
+                            # coturn listens on port 3478 (UDP/TCP) + 443 (TLS)
+                            turn_urls = [
+                                "turn:turn.piedpie.net:3478?transport=udp",
+                                "turn:turn.piedpie.net:3478?transport=tcp",
+                                "turns:turn.piedpie.net:443?transport=tcp",
+                                "stun:turn.piedpie.net:3478",
+                            ]
+                            self.ice_servers.append(RTCIceServer(
+                                urls=turn_urls,
+                                username=username,
+                                credential=credential
+                            ))
+                        logger.info(f"Fetched TURN credentials ({len(self.ice_servers)} servers), urls: {turn_urls}")
+                    else:
+                        logger.warning(f"Failed to fetch TURN credentials: {data}")
+        except Exception as e:
+            logger.error(f"Error fetching TURN credentials: {e}")
 
     async def connect(self):
+        # Fetch TURN credentials before connecting
+        await self.fetch_turn_credentials()
+
         url = f"{SIGNALING_URL}/{BOT_ROOM_ID}"
         logger.info(f"Connecting to signaling server: {url}")
         
-        # Disable SSL verification if needed (common in dev environments)
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
@@ -44,7 +85,6 @@ class PikaloBot:
         msg_type = msg.get("type")
 
         if msg_type == "ping":
-            # Reply to server keepalive pings to prevent connection timeout
             await self.ws.send(json.dumps({"type": "pong"}))
             return
 
@@ -73,10 +113,11 @@ class PikaloBot:
             sender_id = msg.get("sender") or msg.get("senderId")
 
             if signal_type == "offer":
-                # Ignore duplicate offers while a call is active (race condition protection)
-                if self.pc and self.pc.iceConnectionState not in ("closed", "failed", "disconnected"):
-                    logger.info(f"Ignoring duplicate offer from {sender_id} -- active PC in state {self.pc.iceConnectionState}")
+                # Ignore duplicate offers while a call is active AND connected
+                if self.pc and self.pc.iceConnectionState in ("connected", "completed"):
+                    logger.info(f"Ignoring offer from {sender_id} -- active call (state={self.pc.iceConnectionState})")
                 else:
+                    # Accept new offer (clean up any stale/checking PC)
                     logger.info(f"Received offer from {sender_id}. Auto-accepting...")
                     await self.accept_call(sender_id, payload.get("sdp"))
 
@@ -89,10 +130,8 @@ class PikaloBot:
                     ip = candidate_dict.get("address") or candidate_dict.get("ip")
                     foundation = candidate_dict.get("foundation")
                     if not foundation or not ip:
-                        logger.debug("Skipping ICE candidate with missing fields")
                         return
                     try:
-                        # aiortc expects camelCase kwargs
                         candidate = RTCIceCandidate(
                             component=candidate_dict.get("component"),
                             foundation=foundation,
@@ -116,15 +155,26 @@ class PikaloBot:
                 await self.cleanup()
 
     async def accept_call(self, sender_id, sdp):
-        if self.pc:
-            await self.cleanup()
+        # Always clean up previous call
+        await self.cleanup()
 
-        self.pc = RTCPeerConnection()
+        # Create PC with TURN servers for NAT traversal
+        config = RTCConfiguration(iceServers=self.ice_servers) if self.ice_servers else RTCConfiguration()
+        self.pc = RTCPeerConnection(configuration=config)
+        logger.info(f"Created PeerConnection with {len(self.ice_servers)} ICE servers")
         
         @self.pc.on("iceconnectionstatechange")
         async def on_iceconnectionstatechange():
-            logger.info(f"ICE connection state: {self.pc.iceConnectionState}")
-            if self.pc.iceConnectionState == "failed":
+            state = self.pc.iceConnectionState
+            logger.info(f"ICE connection state: {state}")
+            if state == "connected" or state == "completed":
+                logger.info("Call connected successfully!")
+                # Cancel ICE timeout
+                if self.ice_timeout_task:
+                    self.ice_timeout_task.cancel()
+                    self.ice_timeout_task = None
+            elif state == "failed":
+                logger.error("ICE connection failed")
                 await self.cleanup()
 
         @self.pc.on("icecandidate")
@@ -182,12 +232,23 @@ class PikaloBot:
         }))
         logger.info("Sent answer")
 
+        # Start ICE timeout -- if not connected within N seconds, clean up
+        async def ice_timeout():
+            await asyncio.sleep(ICE_TIMEOUT_SECONDS)
+            if self.pc and self.pc.iceConnectionState not in ("connected", "completed", "closed"):
+                logger.warning(f"ICE timeout ({ICE_TIMEOUT_SECONDS}s) -- cleaning up stale PC (state={self.pc.iceConnectionState})")
+                await self.cleanup()
+
+        self.ice_timeout_task = asyncio.create_task(ice_timeout())
+
     async def cleanup(self):
+        if self.ice_timeout_task:
+            self.ice_timeout_task.cancel()
+            self.ice_timeout_task = None
         if self.pc:
             await self.pc.close()
             self.pc = None
         if self.player:
-            # MediaPlayer doesn't have a close, but it stops when tracks are removed
             self.player = None
         logger.info("Cleaned up call state")
 
