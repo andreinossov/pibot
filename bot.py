@@ -5,6 +5,7 @@ import os
 import ssl
 import aiohttp
 import websockets
+from aioice.candidate import Candidate
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaPlayer
 
@@ -17,17 +18,35 @@ BOT_EMAIL = "bot@piedpie.net"
 BOT_ROOM_ID = BOT_EMAIL.lower().strip()[:30].encode().hex()
 SAMPLE_VIDEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample.mp4")
 REG_SERVER = "https://reg.piedpie.net"
-ICE_TIMEOUT_SECONDS = 15  # Max time to wait for ICE connection
+ICE_TIMEOUT_SECONDS = 15
+
+
+class CallSession:
+    """Represents a single call with one peer."""
+
+    def __init__(self, sender_id):
+        self.sender_id = sender_id
+        self.pc = None
+        self.player = None
+        self.ice_timeout_task = None
+
+    async def close(self):
+        if self.ice_timeout_task:
+            self.ice_timeout_task.cancel()
+            self.ice_timeout_task = None
+        if self.pc:
+            await self.pc.close()
+            self.pc = None
+        if self.player:
+            self.player = None
 
 
 class PikaloBot:
     def __init__(self):
-        self.pc = None
         self.ws = None
         self.my_id = None
-        self.player = None
-        self.ice_timeout_task = None
         self.ice_servers = []
+        self.calls = {}  # sender_id -> CallSession
 
     async def fetch_turn_credentials(self):
         """Fetch ephemeral TURN credentials from the registration server."""
@@ -49,19 +68,18 @@ class PikaloBot:
                                 username=server.get("username"),
                                 credential=server.get("credential")
                             ))
-                        logger.info(f"Fetched TURN credentials ({len(self.ice_servers)} servers), urls: {urls}")
+                        logger.info(f"Fetched TURN credentials ({len(self.ice_servers)} servers)")
                     else:
                         logger.warning(f"Failed to fetch TURN credentials: {data}")
         except Exception as e:
             logger.error(f"Error fetching TURN credentials: {e}")
 
     async def connect(self):
-        # Fetch TURN credentials before connecting
         await self.fetch_turn_credentials()
 
         url = f"{SIGNALING_URL}/{BOT_ROOM_ID}"
         logger.info(f"Connecting to signaling server: {url}")
-        
+
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
@@ -81,8 +99,6 @@ class PikaloBot:
             await self.ws.send(json.dumps({"type": "pong"}))
             return
 
-        logger.info(f"Received message: {msg_type}")
-
         if msg_type == "connected":
             self.my_id = msg.get("payload", {}).get("userId")
             logger.info(f"My UUID: {self.my_id}")
@@ -100,38 +116,36 @@ class PikaloBot:
                     }
                 }))
 
+        elif msg_type == "user-left":
+            sender_id = msg.get("payload", {}).get("userId") or msg.get("senderId") or msg.get("sender")
+            if sender_id and sender_id in self.calls:
+                logger.info(f"User left: {sender_id}. Cleaning up call.")
+                await self.cleanup_call(sender_id)
+
         elif msg_type == "signal":
             payload = msg.get("payload", {})
             signal_type = payload.get("type")
             sender_id = msg.get("sender") or msg.get("senderId")
 
             if signal_type == "offer":
-                # Ignore duplicate offers while a call is active AND connected
-                if self.pc and self.pc.iceConnectionState in ("connected", "completed"):
-                    logger.info(f"Ignoring offer from {sender_id} -- active call (state={self.pc.iceConnectionState})")
-                else:
-                    # Accept new offer (clean up any stale/checking PC)
-                    logger.info(f"Received offer from {sender_id}. Auto-accepting...")
-                    await self.accept_call(sender_id, payload.get("sdp"))
+                logger.info(f"Received offer from {sender_id}. Auto-accepting... (active calls: {len(self.calls)})")
+                await self.accept_call(sender_id, payload.get("sdp"))
 
             elif signal_type == "ice-candidate":
-                if self.pc:
+                session = self.calls.get(sender_id)
+                if session and session.pc:
                     candidate_dict = payload.get("candidate")
                     if not candidate_dict:
                         return
-                    
-                    # The browser sends {candidate: "candidate:...", sdpMid: "0", sdpMLineIndex: 0}
+
                     candidate_sdp = candidate_dict.get("candidate", "")
                     sdp_mid = candidate_dict.get("sdpMid", "0")
                     sdp_mline_index = candidate_dict.get("sdpMLineIndex", 0)
-                    
+
                     if not candidate_sdp:
-                        logger.debug("Skipping empty ICE candidate (end-of-candidates)")
                         return
-                    
+
                     try:
-                        # Parse the SDP candidate string using aiortc's built-in parser
-                        from aioice.candidate import Candidate
                         parsed = Candidate.from_sdp(candidate_sdp)
                         candidate = RTCIceCandidate(
                             component=parsed.component,
@@ -146,42 +160,49 @@ class PikaloBot:
                             sdpMid=sdp_mid,
                             sdpMLineIndex=sdp_mline_index
                         )
-                        await self.pc.addIceCandidate(candidate)
-                        logger.info(f"Added ICE candidate: {parsed.type} {parsed.host}:{parsed.port} {parsed.transport}")
+                        await session.pc.addIceCandidate(candidate)
                     except Exception as e:
-                        logger.warning(f"Failed to add ICE candidate: {e} | raw: {candidate_sdp[:80]}")
+                        logger.warning(f"Failed to add ICE candidate for {sender_id}: {e}")
 
             elif signal_type == "hangup":
-                logger.info("Call hung up by peer")
-                await self.cleanup()
+                logger.info(f"Call hung up by {sender_id}")
+                await self.cleanup_call(sender_id)
 
     async def accept_call(self, sender_id, sdp):
-        # Always clean up previous call
-        await self.cleanup()
+        # Clean up any existing call with this same sender
+        if sender_id in self.calls:
+            await self.cleanup_call(sender_id)
 
-        # Create PC with TURN servers for NAT traversal
+        session = CallSession(sender_id)
+        self.calls[sender_id] = session
+
+        # Create PC with TURN servers
         config = RTCConfiguration(iceServers=self.ice_servers) if self.ice_servers else RTCConfiguration()
-        self.pc = RTCPeerConnection(configuration=config)
-        logger.info(f"Created PeerConnection with {len(self.ice_servers)} ICE servers")
-        
-        @self.pc.on("iceconnectionstatechange")
-        async def on_iceconnectionstatechange():
-            state = self.pc.iceConnectionState
-            logger.info(f"ICE connection state: {state}")
-            if state == "connected" or state == "completed":
-                logger.info("Call connected successfully!")
-                # Cancel ICE timeout
-                if self.ice_timeout_task:
-                    self.ice_timeout_task.cancel()
-                    self.ice_timeout_task = None
-            elif state == "failed":
-                logger.error("ICE connection failed")
-                await self.cleanup()
+        session.pc = RTCPeerConnection(configuration=config)
+        logger.info(f"Created PeerConnection for {sender_id} (total calls: {len(self.calls)})")
 
-        @self.pc.on("icecandidate")
+        @session.pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            state = session.pc.iceConnectionState
+            logger.info(f"[{sender_id[:8]}] ICE: {state}")
+            if state in ("connected", "completed"):
+                logger.info(f"[{sender_id[:8]}] Call connected!")
+                if session.ice_timeout_task:
+                    session.ice_timeout_task.cancel()
+                    session.ice_timeout_task = None
+            elif state == "failed":
+                logger.error(f"[{sender_id[:8]}] ICE failed")
+                await self.cleanup_call(sender_id)
+            elif state == "disconnected":
+                # Peer disconnected — clean up after a short grace period
+                await asyncio.sleep(3)
+                if sender_id in self.calls and session.pc and session.pc.iceConnectionState == "disconnected":
+                    logger.info(f"[{sender_id[:8]}] Peer disconnected, cleaning up")
+                    await self.cleanup_call(sender_id)
+
+        @session.pc.on("icecandidate")
         async def on_icecandidate(candidate):
             if candidate:
-                logger.info(f"Sending ICE candidate to {sender_id}")
                 await self.ws.send(json.dumps({
                     "type": "signal",
                     "target": sender_id,
@@ -195,35 +216,32 @@ class PikaloBot:
                     }
                 }))
 
-        # Add video track
+        # Add media tracks
         if os.path.exists(SAMPLE_VIDEO):
-            self.player = MediaPlayer(SAMPLE_VIDEO)
-            if self.player.video:
-                self.pc.addTrack(self.player.video)
-                logger.info("Added video track from sample.mp4")
-            if self.player.audio:
-                self.pc.addTrack(self.player.audio)
-                logger.info("Added audio track from sample.mp4")
+            session.player = MediaPlayer(SAMPLE_VIDEO)
+            if session.player.video:
+                session.pc.addTrack(session.player.video)
+            if session.player.audio:
+                session.pc.addTrack(session.player.audio)
+            logger.info(f"[{sender_id[:8]}] Added media tracks")
         else:
-            logger.warning("sample.mp4 not found. Sending no media.")
+            logger.warning("sample.mp4 not found — no media")
 
         # Handle offer
         offer = RTCSessionDescription(sdp=sdp["sdp"], type=sdp["type"])
-        await self.pc.setRemoteDescription(offer)
-        
-        # Create answer
-        answer = await self.pc.createAnswer()
-        await self.pc.setLocalDescription(answer)
+        await session.pc.setRemoteDescription(offer)
 
-        # Send answer
+        # Create and send answer
+        answer = await session.pc.createAnswer()
+        await session.pc.setLocalDescription(answer)
         await self.ws.send(json.dumps({
             "type": "signal",
             "target": sender_id,
             "payload": {
                 "type": "answer",
                 "sdp": {
-                    "type": self.pc.localDescription.type,
-                    "sdp": self.pc.localDescription.sdp
+                    "type": session.pc.localDescription.type,
+                    "sdp": session.pc.localDescription.sdp
                 },
                 "identity": {
                     "username": "WebRTC Bot",
@@ -231,27 +249,23 @@ class PikaloBot:
                 }
             }
         }))
-        logger.info("Sent answer")
+        logger.info(f"[{sender_id[:8]}] Sent answer")
 
-        # Start ICE timeout -- if not connected within N seconds, clean up
+        # ICE timeout
         async def ice_timeout():
             await asyncio.sleep(ICE_TIMEOUT_SECONDS)
-            if self.pc and self.pc.iceConnectionState not in ("connected", "completed", "closed"):
-                logger.warning(f"ICE timeout ({ICE_TIMEOUT_SECONDS}s) -- cleaning up stale PC (state={self.pc.iceConnectionState})")
-                await self.cleanup()
+            if sender_id in self.calls and session.pc and session.pc.iceConnectionState not in ("connected", "completed", "closed"):
+                logger.warning(f"[{sender_id[:8]}] ICE timeout — cleaning up")
+                await self.cleanup_call(sender_id)
 
-        self.ice_timeout_task = asyncio.create_task(ice_timeout())
+        session.ice_timeout_task = asyncio.create_task(ice_timeout())
 
-    async def cleanup(self):
-        if self.ice_timeout_task:
-            self.ice_timeout_task.cancel()
-            self.ice_timeout_task = None
-        if self.pc:
-            await self.pc.close()
-            self.pc = None
-        if self.player:
-            self.player = None
-        logger.info("Cleaned up call state")
+    async def cleanup_call(self, sender_id):
+        session = self.calls.pop(sender_id, None)
+        if session:
+            await session.close()
+            logger.info(f"[{sender_id[:8]}] Cleaned up (remaining calls: {len(self.calls)})")
+
 
 async def main():
     bot = PikaloBot()
@@ -260,7 +274,11 @@ async def main():
             await bot.connect()
         except Exception as e:
             logger.error(f"Connection error: {e}. Retrying in 5s...")
+            # Clean up all calls on disconnect
+            for sid in list(bot.calls.keys()):
+                await bot.cleanup_call(sid)
             await asyncio.sleep(5)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
