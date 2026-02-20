@@ -11,6 +11,8 @@ from aiortc.contrib.media import MediaPlayer
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pibot")
+# Enable DEBUG for ICE diagnostics
+logging.getLogger("aioice").setLevel(logging.DEBUG)
 
 SIGNALING_URL = "wss://sig.piedpie.net"
 BOT_EMAIL = "bot@piedpie.net"
@@ -41,22 +43,15 @@ class PikaloBot:
                     if data.get("success") and data.get("iceServers"):
                         self.ice_servers = []
                         for server in data["iceServers"]:
-                            username = server.get("username")
-                            credential = server.get("credential")
-                            # Add all TURN URL variants for best connectivity
-                            # coturn listens on port 3478 (UDP/TCP) + 443 (TLS)
-                            turn_urls = [
-                                "turn:turn.piedpie.net:3478?transport=udp",
-                                "turn:turn.piedpie.net:3478?transport=tcp",
-                                "turns:turn.piedpie.net:443?transport=tcp",
-                                "stun:turn.piedpie.net:3478",
-                            ]
+                            urls = server.get("urls", [])
+                            if isinstance(urls, str):
+                                urls = [urls]
                             self.ice_servers.append(RTCIceServer(
-                                urls=turn_urls,
-                                username=username,
-                                credential=credential
+                                urls=urls,
+                                username=server.get("username"),
+                                credential=server.get("credential")
                             ))
-                        logger.info(f"Fetched TURN credentials ({len(self.ice_servers)} servers), urls: {turn_urls}")
+                        logger.info(f"Fetched TURN credentials ({len(self.ice_servers)} servers), urls: {urls}")
                     else:
                         logger.warning(f"Failed to fetch TURN credentials: {data}")
         except Exception as e:
@@ -126,29 +121,37 @@ class PikaloBot:
                     candidate_dict = payload.get("candidate")
                     if not candidate_dict:
                         return
-                    # Skip candidates with missing required fields
-                    ip = candidate_dict.get("address") or candidate_dict.get("ip")
-                    foundation = candidate_dict.get("foundation")
-                    if not foundation or not ip:
+                    
+                    # The browser sends {candidate: "candidate:...", sdpMid: "0", sdpMLineIndex: 0}
+                    candidate_sdp = candidate_dict.get("candidate", "")
+                    sdp_mid = candidate_dict.get("sdpMid", "0")
+                    sdp_mline_index = candidate_dict.get("sdpMLineIndex", 0)
+                    
+                    if not candidate_sdp:
+                        logger.debug("Skipping empty ICE candidate (end-of-candidates)")
                         return
+                    
                     try:
+                        # Parse the SDP candidate string using aiortc's built-in parser
+                        from aioice.candidate import Candidate
+                        parsed = Candidate.from_sdp(candidate_sdp)
                         candidate = RTCIceCandidate(
-                            component=candidate_dict.get("component"),
-                            foundation=foundation,
-                            ip=ip,
-                            port=candidate_dict.get("port"),
-                            priority=candidate_dict.get("priority"),
-                            protocol=candidate_dict.get("protocol"),
-                            type=candidate_dict.get("type"),
-                            relatedAddress=candidate_dict.get("relatedAddress"),
-                            relatedPort=candidate_dict.get("relatedPort"),
-                            sdpMid=candidate_dict.get("sdpMid"),
-                            sdpMLineIndex=candidate_dict.get("sdpMLineIndex")
+                            component=parsed.component,
+                            foundation=parsed.foundation,
+                            ip=parsed.host,
+                            port=parsed.port,
+                            priority=parsed.priority,
+                            protocol=parsed.transport,
+                            type=parsed.type,
+                            relatedAddress=parsed.related_address,
+                            relatedPort=parsed.related_port,
+                            sdpMid=sdp_mid,
+                            sdpMLineIndex=sdp_mline_index
                         )
                         await self.pc.addIceCandidate(candidate)
-                        logger.info("Added ICE candidate")
+                        logger.info(f"Added ICE candidate: {parsed.type} {parsed.host}:{parsed.port} {parsed.transport}")
                     except Exception as e:
-                        logger.warning(f"Failed to add ICE candidate: {e}")
+                        logger.warning(f"Failed to add ICE candidate: {e} | raw: {candidate_sdp[:80]}")
 
             elif signal_type == "hangup":
                 logger.info("Call hung up by peer")
