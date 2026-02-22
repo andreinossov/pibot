@@ -9,8 +9,12 @@ from aioice.candidate import Candidate
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaPlayer
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger("pibot")
 
 SIGNALING_URL = "wss://sig.piedpie.net"
@@ -84,7 +88,13 @@ class PikaloBot:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        self.ws = await websockets.connect(url, ssl=ssl_context)
+        self.ws = await websockets.connect(
+            url,
+            ssl=ssl_context,
+            ping_interval=30,
+            ping_timeout=10,
+            close_timeout=5
+        )
         await self.ws.send(json.dumps({"type": "join"}))
         logger.info("Joined room: " + BOT_ROOM_ID)
 
@@ -98,6 +108,8 @@ class PikaloBot:
         if msg_type == "ping":
             await self.ws.send(json.dumps({"type": "pong"}))
             return
+
+        logger.info(f"Received message: {msg_type}")
 
         if msg_type == "connected":
             self.my_id = msg.get("payload", {}).get("userId")
